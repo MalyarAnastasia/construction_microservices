@@ -1,51 +1,20 @@
 const express = require('express');
 const Joi = require('joi');
-const { v4: uuidv4 } = require('uuid');
 const router = express.Router();
+const { projectRepository } = require('../db/queries');
+const { authenticateToken, authorizeRoles } = require('../middleware/auth'); // Добавляем
 
-// Middleware для проверки JWT (упрощенный, позже вынесем в отдельный файл)
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
 
-  if (!token) {
-    return res.status(401).json({
-      success: false,
-      error: {
-        code: 'TOKEN_REQUIRED',
-        message: 'Требуется токен авторизации'
-      }
-    });
-  }
-
-  // В реальном приложении здесь будет проверка JWT
-  // Для тестирования просто декодируем
-  try {
-    // Простая заглушка - в реальности нужно проверять подпись
-    req.user = { id: 'user-id-from-token' };
-    next();
-  } catch (error) {
-    return res.status(403).json({
-      success: false,
-      error: {
-        code: 'INVALID_TOKEN',
-        message: 'Неверный токен'
-      }
-    });
-  }
-};
-
-// Временное хранилище проектов
-const projects = [];
-
-// Схема валидации создания проекта
 const createProjectSchema = Joi.object({
   title: Joi.string().min(3).max(100).required(),
   description: Joi.string().min(10).max(1000).required(),
   address: Joi.string().min(5).required(),
   startDate: Joi.date().iso(),
-  endDate: Joi.date().iso().greater(Joi.ref('startDate')),
-  budget: Joi.number().min(0)
+  endDate: Joi.date().iso().min(Joi.ref('startDate')).messages({
+    'date.min': 'Дата окончания должна быть не раньше даты начала'
+  }),
+  budget: Joi.number().min(0),
+  status: Joi.string().valid('draft', 'active', 'completed', 'cancelled').default('draft')
 });
 
 /**
@@ -85,6 +54,10 @@ const createProjectSchema = Joi.object({
  *               budget:
  *                 type: number
  *                 example: 5000000
+ *               status:
+ *                 type: string
+ *                 enum: [draft, active, completed, cancelled]
+ *                 default: draft
  *     responses:
  *       201:
  *         description: Проект успешно создан
@@ -99,7 +72,7 @@ const createProjectSchema = Joi.object({
  *                 data:
  *                   $ref: '#/components/schemas/Project'
  */
-router.post('/projects', authenticateToken, (req, res) => {
+router.post('/projects', authenticateToken, async (req, res) => {
   const { error, value } = createProjectSchema.validate(req.body);
   
   if (error) {
@@ -112,22 +85,37 @@ router.post('/projects', authenticateToken, (req, res) => {
     });
   }
 
-  const newProject = {
-    id: uuidv4(),
-    userId: req.user.id,
-    ...value,
-    status: 'draft',
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString()
-  };
+  try {
+    const newProject = await projectRepository.create({
+      userId: req.user.id,
+      ...value
+    });
 
-  projects.push(newProject);
-  req.log.info(`Project created: ${newProject.title} by user ${req.user.id}`);
+    req.log.info(`Project created: ${newProject.title} by user ${req.user.id}`);
+    
+    // Публикация события
+    req.log.info(`Event: PROJECT_CREATED, payload: ${JSON.stringify({
+      projectId: newProject.id,
+      userId: newProject.user_id,
+      title: newProject.title,
+      status: newProject.status,
+      timestamp: new Date().toISOString()
+    })}`);
 
-  res.status(201).json({
-    success: true,
-    data: newProject
-  });
+    res.status(201).json({
+      success: true,
+      data: newProject
+    });
+  } catch (error) {
+    req.log.error(error, 'Create project error');
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'DATABASE_ERROR',
+        message: 'Ошибка при создании проекта'
+      }
+    });
+  }
 });
 
 /**
@@ -159,37 +147,55 @@ router.post('/projects', authenticateToken, (req, res) => {
  *                   example: true
  *                 data:
  *                   $ref: '#/components/schemas/Project'
+ *       403:
+ *         description: Нет доступа
  *       404:
  *         description: Проект не найден
  */
-router.get('/projects/:id', authenticateToken, (req, res) => {
-  const project = projects.find(p => p.id === req.params.id);
-  
-  if (!project) {
-    return res.status(404).json({
+router.get('/projects/:id', authenticateToken, async (req, res) => {
+  try {
+    const project = await projectRepository.findById(req.params.id);
+    
+    if (!project) {
+      return res.status(404).json({
+        success: false,
+        error: {
+          code: 'PROJECT_NOT_FOUND',
+          message: 'Проект не найден'
+        }
+      });
+    }
+
+    // Проверка прав доступа (только создатель, менеджер или админ)
+    const hasAccess = 
+      project.user_id === req.user.id ||
+      req.user.roles.includes('manager') ||
+      req.user.roles.includes('admin');
+
+    if (!hasAccess) {
+      return res.status(403).json({
+        success: false,
+        error: {
+          code: 'FORBIDDEN',
+          message: 'Нет доступа к этому проекту'
+        }
+      });
+    }
+
+    res.json({
+      success: true,
+      data: project
+    });
+  } catch (error) {
+    req.log.error(error, 'Get project error');
+    res.status(500).json({
       success: false,
       error: {
-        code: 'PROJECT_NOT_FOUND',
-        message: 'Проект не найден'
+        code: 'DATABASE_ERROR',
+        message: 'Ошибка при получении проекта'
       }
     });
   }
-
-  // Проверка прав доступа (только создатель)
-  if (project.userId !== req.user.id) {
-    return res.status(403).json({
-      success: false,
-      error: {
-        code: 'FORBIDDEN',
-        message: 'Нет доступа к этому проекту'
-      }
-    });
-  }
-
-  res.json({
-    success: true,
-    data: project
-  });
 });
 
 /**
@@ -246,36 +252,254 @@ router.get('/projects/:id', authenticateToken, (req, res) => {
  *                           type: integer
  *                         total:
  *                           type: integer
+ *                         totalPages:
+ *                           type: integer
  */
-router.get('/projects', authenticateToken, (req, res) => {
+router.get('/projects', authenticateToken, async (req, res) => {
   const { page = 1, limit = 10, status } = req.query;
   const pageNum = parseInt(page);
   const limitNum = parseInt(limit);
-
-  // Фильтрация проектов пользователя
-  let userProjects = projects.filter(p => p.userId === req.user.id);
   
-  if (status) {
-    userProjects = userProjects.filter(p => p.status === status);
-  }
+  try {
+    const { projects, total } = await projectRepository.findByUserId(req.user.id, {
+      page: pageNum,
+      limit: limitNum,
+      status
+    });
 
-  // Пагинация
-  const startIndex = (pageNum - 1) * limitNum;
-  const endIndex = pageNum * limitNum;
-  const paginatedProjects = userProjects.slice(startIndex, endIndex);
-
-  res.json({
-    success: true,
-    data: {
-      projects: paginatedProjects,
-      pagination: {
-        page: pageNum,
-        limit: limitNum,
-        total: userProjects.length,
-        totalPages: Math.ceil(userProjects.length / limitNum)
+    res.json({
+      success: true,
+      data: {
+        projects,
+        pagination: {
+          page: pageNum,
+          limit: limitNum,
+          total,
+          totalPages: Math.ceil(total / limitNum)
+        }
       }
+    });
+  } catch (error) {
+    req.log.error(error, 'Get projects list error');
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'DATABASE_ERROR',
+        message: 'Ошибка при получении списка проектов'
+      }
+    });
+  }
+});
+
+/**
+ * @swagger
+ * /api/v1/orders/projects/{id}:
+ *   put:
+ *     summary: Обновить проект
+ *     tags: [Projects]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               title:
+ *                 type: string
+ *                 example: Обновленное название
+ *               description:
+ *                 type: string
+ *                 example: Обновленное описание
+ *               address:
+ *                 type: string
+ *                 example: Новый адрес
+ *               status:
+ *                 type: string
+ *                 enum: [draft, active, completed, cancelled]
+ *               startDate:
+ *                 type: string
+ *                 format: date
+ *               endDate:
+ *                 type: string
+ *                 format: date
+ *               budget:
+ *                 type: number
+ *     responses:
+ *       200:
+ *         description: Проект обновлен
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   $ref: '#/components/schemas/Project'
+ *       403:
+ *         description: Нет прав на обновление
+ */
+router.put('/projects/:id', authenticateToken, async (req, res) => {
+  try {
+    const project = await projectRepository.findById(req.params.id);
+    
+    if (!project) {
+      return res.status(404).json({
+        success: false,
+        error: {
+          code: 'PROJECT_NOT_FOUND',
+          message: 'Проект не найден'
+        }
+      });
     }
-  });
+
+    // Проверка прав (только создатель, менеджер или админ)
+    const canUpdate = 
+      project.user_id === req.user.id ||
+      req.user.roles.includes('manager') ||
+      req.user.roles.includes('admin');
+
+    if (!canUpdate) {
+      return res.status(403).json({
+        success: false,
+        error: {
+          code: 'FORBIDDEN',
+          message: 'Нет прав на обновление проекта'
+        }
+      });
+    }
+
+    const updateSchema = Joi.object({
+      title: Joi.string().min(3).max(100),
+      description: Joi.string().min(10).max(1000),
+      address: Joi.string().min(5),
+      status: Joi.string().valid('draft', 'active', 'completed', 'cancelled'),
+      startDate: Joi.date().iso(),
+      endDate: Joi.date().iso().min(Joi.ref('startDate')).messages({
+        'date.min': 'Дата окончания должна быть не раньше даты начала'
+      }),
+      budget: Joi.number().min(0)
+    });
+
+    const { error, value } = updateSchema.validate(req.body);
+    if (error) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: error.details[0].message
+        }
+      });
+    }
+
+    const updatedProject = await projectRepository.update(req.params.id, value);
+
+    // Публикация события обновления статуса
+    if (value.status && value.status !== project.status) {
+      req.log.info(`Event: PROJECT_STATUS_UPDATED, payload: ${JSON.stringify({
+        projectId: project.id,
+        oldStatus: project.status,
+        newStatus: value.status,
+        updatedBy: req.user.id,
+        timestamp: new Date().toISOString()
+      })}`);
+    }
+
+    res.json({
+      success: true,
+      data: updatedProject
+    });
+  } catch (error) {
+    req.log.error(error, 'Update project error');
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'DATABASE_ERROR',
+        message: 'Ошибка при обновлении проекта'
+      }
+    });
+  }
+});
+
+/**
+ * @swagger
+ * /api/v1/orders/projects/{id}:
+ *   delete:
+ *     summary: Удалить проект
+ *     tags: [Projects]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: Проект удален
+ *       403:
+ *         description: Нет прав на удаление
+ *       404:
+ *         description: Проект не найден
+ */
+router.delete('/projects/:id', authenticateToken, async (req, res) => {
+  try {
+    const project = await projectRepository.findById(req.params.id);
+    
+    if (!project) {
+      return res.status(404).json({
+        success: false,
+        error: {
+          code: 'PROJECT_NOT_FOUND',
+          message: 'Проект не найден'
+        }
+      });
+    }
+
+    // Удалять могут только создатель или админ
+    const canDelete = 
+      project.user_id === req.user.id ||
+      req.user.roles.includes('admin');
+
+    if (!canDelete) {
+      return res.status(403).json({
+        success: false,
+        error: {
+          code: 'FORBIDDEN',
+          message: 'Нет прав на удаление проекта'
+        }
+      });
+    }
+
+    await projectRepository.delete(req.params.id);
+    req.log.info(`Project deleted: ${project.id}`);
+
+    res.json({
+      success: true,
+      data: { message: 'Проект успешно удален' }
+    });
+  } catch (error) {
+    req.log.error(error, 'Delete project error');
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'DATABASE_ERROR',
+        message: 'Ошибка при удалении проекта'
+      }
+    });
+  }
 });
 
 module.exports = router;
