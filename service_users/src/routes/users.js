@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { authenticateToken, authorizeRoles } = require('../middleware/auth');
-const { users } = require('./auth'); 
+const userRepository = require('../db/queries');
 
 /**
  * @swagger
@@ -30,26 +30,37 @@ const { users } = require('./auth');
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Пользователь не найден
  */
-router.get('/profile', authenticateToken, (req, res) => {
-  const user = users.find(u => u.id === req.user.id);
-  
-  if (!user) {
-    return res.status(404).json({
+router.get('/profile', authenticateToken, async (req, res) => {
+  try {
+    const user = await userRepository.findById(req.user.id);
+    
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: {
+          code: 'USER_NOT_FOUND',
+          message: 'Пользователь не найден'
+        }
+      });
+    }
+    
+    res.json({
+      success: true,
+      data: user
+    });
+  } catch (error) {
+    req.log.error(error, 'Get profile error');
+    res.status(500).json({
       success: false,
       error: {
-        code: 'USER_NOT_FOUND',
-        message: 'Пользователь не найден'
+        code: 'DATABASE_ERROR',
+        message: 'Ошибка при получении профиля'
       }
     });
   }
-
-  const { passwordHash, ...userWithoutPassword } = user;
-  
-  res.json({
-    success: true,
-    data: userWithoutPassword
-  });
 });
 
 /**
@@ -85,32 +96,43 @@ router.get('/profile', authenticateToken, (req, res) => {
  *                   $ref: '#/components/schemas/User'
  *       401:
  *         description: Не авторизован
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Пользователь не найден
  */
-router.put('/profile', authenticateToken, (req, res) => {
+router.put('/profile', authenticateToken, async (req, res) => {
   const { name } = req.body;
-  const userIndex = users.findIndex(u => u.id === req.user.id);
   
-  if (userIndex === -1) {
-    return res.status(404).json({
+  try {
+    const updatedUser = await userRepository.update(req.user.id, { name });
+    
+    if (!updatedUser) {
+      return res.status(404).json({
+        success: false,
+        error: {
+          code: 'USER_NOT_FOUND',
+          message: 'Пользователь не найден'
+        }
+      });
+    }
+    
+    res.json({
+      success: true,
+      data: updatedUser
+    });
+  } catch (error) {
+    req.log.error(error, 'Update profile error');
+    res.status(500).json({
       success: false,
       error: {
-        code: 'USER_NOT_FOUND',
-        message: 'Пользователь не найден'
+        code: 'DATABASE_ERROR',
+        message: 'Ошибка при обновлении профиля'
       }
     });
   }
-
-  if (name) {
-    users[userIndex].name = name;
-    users[userIndex].updatedAt = new Date().toISOString();
-  }
-
-  const { passwordHash, ...updatedUser } = users[userIndex];
-  
-  res.json({
-    success: true,
-    data: updatedUser
-  });
 });
 
 /**
@@ -167,40 +189,49 @@ router.put('/profile', authenticateToken, (req, res) => {
  *                           type: integer
  *                         total:
  *                           type: integer
+ *                         totalPages:
+ *                           type: integer
  *       403:
  *         description: Недостаточно прав
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  */
-router.get('/', authenticateToken, authorizeRoles('admin'), (req, res) => {
+router.get('/', authenticateToken, authorizeRoles('admin'), async (req, res) => {
   const { page = 1, limit = 10, role } = req.query;
   const pageNum = parseInt(page);
   const limitNum = parseInt(limit);
-
-  let filteredUsers = users;
-  if (role) {
-    filteredUsers = users.filter(u => u.roles.includes(role));
-  }
-
-  const startIndex = (pageNum - 1) * limitNum;
-  const endIndex = pageNum * limitNum;
-  const paginatedUsers = filteredUsers.slice(startIndex, endIndex);
-
-  const usersWithoutPasswords = paginatedUsers.map(user => {
-    const { passwordHash, ...userWithoutPassword } = user;
-    return userWithoutPassword;
-  });
-
-  res.json({
-    success: true,
-    data: {
-      users: usersWithoutPasswords,
-      pagination: {
-        page: pageNum,
-        limit: limitNum,
-        total: filteredUsers.length,
-        totalPages: Math.ceil(filteredUsers.length / limitNum)
+  
+  try {
+    const { users, total } = await userRepository.findAll({
+      page: pageNum,
+      limit: limitNum,
+      role
+    });
+    
+    res.json({
+      success: true,
+      data: {
+        users,
+        pagination: {
+          page: pageNum,
+          limit: limitNum,
+          total,
+          totalPages: Math.ceil(total / limitNum)
+        }
       }
-    }
-  });
+    });
+  } catch (error) {
+    req.log.error(error, 'Get users list error');
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'DATABASE_ERROR',
+        message: 'Ошибка при получении списка пользователей'
+      }
+    });
+  }
 });
 
 module.exports = router;

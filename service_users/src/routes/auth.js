@@ -2,11 +2,8 @@ const express = require('express');
 const Joi = require('joi');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
-const { v4: uuidv4 } = require('uuid');
 const router = express.Router();
-
-
-const users = [];
+const userRepository = require('../db/queries');
 
 const registerSchema = Joi.object({
   email: Joi.string().email().required(),
@@ -101,39 +98,47 @@ router.post('/register', async (req, res) => {
 
   const { email, password, name, role } = value;
 
-  if (users.find(u => u.email === email)) {
-    return res.status(409).json({
+  try {
+    const existingUser = await userRepository.findByEmail(email);
+    if (existingUser) {
+      return res.status(409).json({
+        success: false,
+        error: { 
+          code: 'USER_EXISTS', 
+          message: 'Пользователь с таким email уже существует' 
+        }
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const newUser = await userRepository.create({
+      email,
+      passwordHash: hashedPassword,
+      name,
+      role
+    });
+
+    req.log.info(`User registered: ${email}`);
+
+    res.status(201).json({
+      success: true,
+      data: { 
+        id: newUser.id, 
+        email: newUser.email, 
+        name: newUser.name,
+        role: newUser.roles[0]
+      }
+    });
+  } catch (error) {
+    req.log.error(error, 'Registration error');
+    res.status(500).json({
       success: false,
-      error: { 
-        code: 'USER_EXISTS', 
-        message: 'Пользователь с таким email уже существует' 
+      error: {
+        code: 'DATABASE_ERROR',
+        message: 'Ошибка при регистрации пользователя'
       }
     });
   }
-
-  const hashedPassword = await bcrypt.hash(password, 10);
-  const newUser = {
-    id: uuidv4(),
-    email,
-    passwordHash: hashedPassword,
-    name,
-    roles: [role],
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString()
-  };
-
-  users.push(newUser);
-  req.log.info(`User registered: ${email}`);
-
-  res.status(201).json({
-    success: true,
-    data: { 
-      id: newUser.id, 
-      email: newUser.email, 
-      name: newUser.name,
-      role: newUser.roles[0]
-    }
-  });
 });
 
 /**
@@ -210,55 +215,66 @@ router.post('/login', async (req, res) => {
 
   const { email, password } = value;
 
-  const user = users.find(u => u.email === email);
-  if (!user) {
-    return res.status(401).json({
-      success: false,
-      error: {
-        code: 'INVALID_CREDENTIALS',
-        message: 'Неверный email или пароль'
-      }
-    });
-  }
-
-  const isPasswordValid = await bcrypt.compare(password, user.passwordHash);
-  if (!isPasswordValid) {
-    return res.status(401).json({
-      success: false,
-      error: {
-        code: 'INVALID_CREDENTIALS',
-        message: 'Неверный email или пароль'
-      }
-    });
-  }
-
-  const tokenPayload = {
-    id: user.id,
-    email: user.email,
-    name: user.name,
-    roles: user.roles
-  };
-
-  const token = jwt.sign(
-    tokenPayload,
-    process.env.JWT_SECRET || 'your-secret-key',
-    { expiresIn: process.env.JWT_EXPIRES_IN || '24h' }
-  );
-
-  req.log.info(`User logged in: ${email}`);
-
-  res.json({
-    success: true,
-    data: {
-      token,
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        roles: user.roles
-      }
+  try {
+    const user = await userRepository.findByEmail(email);
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        error: {
+          code: 'INVALID_CREDENTIALS',
+          message: 'Неверный email или пароль'
+        }
+      });
     }
-  });
+
+    const isPasswordValid = await bcrypt.compare(password, user.password_hash);
+    if (!isPasswordValid) {
+      return res.status(401).json({
+        success: false,
+        error: {
+          code: 'INVALID_CREDENTIALS',
+          message: 'Неверный email или пароль'
+        }
+      });
+    }
+
+    const tokenPayload = {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      roles: user.roles
+    };
+
+    const token = jwt.sign(
+      tokenPayload,
+      process.env.JWT_SECRET || 'your-secret-key',
+      { expiresIn: process.env.JWT_EXPIRES_IN || '24h' }
+    );
+
+    req.log.info(`User logged in: ${email}`);
+
+    res.json({
+      success: true,
+      data: {
+        token,
+        user: {
+          id: user.id,
+          email: user.email,
+          name: user.name,
+          roles: user.roles
+        }
+      }
+    });
+  } catch (error) {
+    req.log.error(error, 'Login error');
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'DATABASE_ERROR',
+        message: 'Ошибка при входе в систему'
+      }
+    });
+  }
 });
 
 /**
@@ -281,7 +297,4 @@ router.get('/health', (req, res) => {
   });
 });
 
-module.exports = {
-  router,
-  users
-};
+module.exports = router;
